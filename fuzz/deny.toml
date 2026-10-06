@@ -1,0 +1,25 @@
+[advisories]
+ignore = []
+
+[licenses]
+allow = ["MIT", "Apache-2.0"]
+confidence-threshold = 0.8
+
+[licenses.private]
+ignore = false
+registries = []
+
+# libfuzzer-sys includes LLVM/libFuzzer code under NCSA in the isolated fuzz workspace.
+[[licenses.exceptions]]
+name = "libfuzzer-sys"
+allow = ["NCSA"]
+
+[bans]
+multiple-versions = "warn"
+wildcards = "deny"
+
+[sources]
+unknown-registry = "deny"
+unknown-git = "deny"
+allow-registry = ["https://github.com/rust-lang/crates.io-index"]
+allow-git = []

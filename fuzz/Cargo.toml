@@ -1,0 +1,24 @@
+[package]
+name = "rylv-pool-fuzz"
+version = "0.0.0"
+edition = "2024"
+publish = false
+license = "MIT OR Apache-2.0"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+rylv-pool = { path = "..", version = "0.1.0" }
+
+[[bin]]
+name = "pool_lifecycle"
+path = "fuzz_targets/pool_lifecycle.rs"
+test = false
+doc = false
+bench = false
+
+# Keep fuzz dependencies out of the library's workspace and lockfile.
+[workspace]
+members = ["."]
