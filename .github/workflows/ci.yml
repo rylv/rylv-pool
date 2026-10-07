@@ -11,7 +11,7 @@ permissions:
   contents: read
 
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
@@ -74,6 +74,14 @@ jobs:
       - run: cargo fmt --all -- --check
       - run: cargo fmt --manifest-path fuzz/Cargo.toml --all -- --check
 
+  workflow-scripts:
+    name: Workflow scripts
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - run: python3 -m unittest discover -s .github/scripts -p 'test_*.py'
+
   msrv:
     name: MSRV 1.85.0 (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
@@ -124,7 +132,7 @@ jobs:
           components: llvm-tools-preview
       - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2
         with:
-          tool: cargo-llvm-cov
+          tool: cargo-llvm-cov@0.8.4
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: coverage
@@ -166,7 +174,18 @@ jobs:
       - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
         with:
           toolchain: nightly
-          components: miri
+          components: miri, rust-src
+      - name: Identify the Miri toolchain
+        id: miri-toolchain
+        shell: bash
+        run: |
+          fingerprint="$(rustc +nightly -Vv | sha256sum | cut -d ' ' -f 1)"
+          printf 'fingerprint=%s\n' "$fingerprint" >> "$GITHUB_OUTPUT"
+      - name: Cache the Miri sysroot
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.cache/miri
+          key: miri-sysroot-${{ runner.os }}-${{ runner.arch }}-${{ steps.miri-toolchain.outputs.fingerprint }}
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           key: miri-${{ matrix.seed }}
@@ -184,7 +203,7 @@ jobs:
           toolchain: nightly
       - uses: taiki-e/install-action@f7e5d7c961414b23f5b25b2da9294395d08513ad # v2
         with:
-          tool: cargo-fuzz
+          tool: cargo-fuzz@0.13.1
       - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
         with:
           workspaces: fuzz
@@ -207,6 +226,122 @@ jobs:
             fuzz/Cargo.lock
           if-no-files-found: warn
           retention-days: 14
+
+  benchmark:
+    name: Benchmark comparison
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    env:
+      BASE_SHA: ${{ github.event.pull_request.base.sha }}
+      HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+      BASE_DIRECTORY: ${{ github.workspace }}/../pool-bench-base
+      HEAD_DIRECTORY: ${{ github.workspace }}/../pool-bench-pr
+      CARGO_TARGET_DIR: ${{ github.workspace }}/target-benchmark
+      CRITERION_HOME: ${{ github.workspace }}/target-benchmark/criterion
+      BENCHMARK_THRESHOLD_PERCENT: ${{ vars.BENCHMARK_THRESHOLD_PERCENT || '15' }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Prepare base and PR worktrees
+        run: |
+          git fetch --no-tags --depth=1 origin "$BASE_SHA" "$HEAD_SHA"
+          git worktree add --detach "$BASE_DIRECTORY" "$BASE_SHA"
+          git worktree add --detach "$HEAD_DIRECTORY" "$HEAD_SHA"
+      - name: Check for a comparable Criterion baseline
+        id: scope
+        run: |
+          python3 .github/scripts/benchmark_scope.py \
+            --base-directory "$BASE_DIRECTORY" --head-directory "$HEAD_DIRECTORY" \
+            --base-sha "$BASE_SHA" --head-sha "$HEAD_SHA" \
+            --json-output "$CARGO_TARGET_DIR/scope.json" \
+            --summary-output "$CARGO_TARGET_DIR/comparison.md" \
+            --github-output "$GITHUB_OUTPUT" --step-summary "$GITHUB_STEP_SUMMARY"
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067 # master
+        if: steps.scope.outputs.required == 'true'
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@6323deb102c322ba6fcbdcafc7e3dddab59af2b6 # v2
+        if: steps.scope.outputs.required == 'true'
+        with:
+          workspaces: '. -> target-benchmark'
+          key: benchmark
+      - name: Install critcmp
+        if: steps.scope.outputs.required == 'true'
+        run: cargo install critcmp --version 0.1.8 --locked
+      - name: Discard cached measurements
+        if: steps.scope.outputs.required == 'true'
+        run: |
+          python3 - <<'PY'
+          import os, shutil
+          shutil.rmtree(os.environ['CRITERION_HOME'], ignore_errors=True)
+          PY
+      - name: Measure base revision
+        if: steps.scope.outputs.required == 'true'
+        timeout-minutes: 10
+        working-directory: ${{ env.BASE_DIRECTORY }}
+        run: cargo bench --locked --bench pool -- --save-baseline base --noplot --sample-size 30 --warm-up-time 0.5 --measurement-time 1
+      - name: Measure PR revision
+        if: steps.scope.outputs.required == 'true'
+        timeout-minutes: 10
+        working-directory: ${{ env.HEAD_DIRECTORY }}
+        run: cargo bench --locked --bench pool -- --save-baseline pr --noplot --sample-size 30 --warm-up-time 0.5 --measurement-time 1
+      - name: Compare with critcmp and reject regressions
+        if: steps.scope.outputs.required == 'true'
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          import math, os
+          threshold = float(os.environ['BENCHMARK_THRESHOLD_PERCENT'])
+          if not math.isfinite(threshold) or threshold < 0:
+              raise SystemExit('BENCHMARK_THRESHOLD_PERCENT must be finite and nonnegative')
+          PY
+          critcmp base pr --color never > "$CARGO_TARGET_DIR/comparison.txt"
+          critcmp base pr --color never --list > "$CARGO_TARGET_DIR/comparison-list.txt"
+          if ! critcmp base pr --color never --list --threshold "$BENCHMARK_THRESHOLD_PERCENT" \
+            > "$CARGO_TARGET_DIR/significant.txt" 2> "$CARGO_TARGET_DIR/critcmp-errors.txt"; then
+            # critcmp reports an empty filtered comparison as an error.
+            if [ "$(cat "$CARGO_TARGET_DIR/critcmp-errors.txt")" != 'no benchmark comparisons to show' ]; then
+              cat "$CARGO_TARGET_DIR/critcmp-errors.txt" >&2
+              exit 1
+            fi
+          fi
+          gate_status=0
+          awk -f .github/scripts/benchmark_gate.awk \
+            "$CARGO_TARGET_DIR/comparison-list.txt" "$CARGO_TARGET_DIR/significant.txt" \
+            > "$CARGO_TARGET_DIR/gate.txt" || gate_status=$?
+          {
+            printf '## Benchmark comparison\n\nBase: `%s` · PR: `%s`\n\n' "$BASE_SHA" "$HEAD_SHA"
+            printf 'PR mean batch time increases greater than %s%% fail this check.\n\n' "$BENCHMARK_THRESHOLD_PERCENT"
+            printf '```text\n'
+            cat "$CARGO_TARGET_DIR/comparison.txt"
+            printf '```\n\n'
+            cat "$CARGO_TARGET_DIR/gate.txt"
+          } > "$CARGO_TARGET_DIR/comparison.md"
+          cat "$CARGO_TARGET_DIR/comparison.md"
+          cat "$CARGO_TARGET_DIR/comparison.md" >> "$GITHUB_STEP_SUMMARY"
+          exit "$gate_status"
+      - name: Upload benchmark estimates and comparison
+        if: ${{ !cancelled() }}
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: benchmark-comparison
+          path: |
+            target-benchmark/scope.json
+            target-benchmark/comparison.md
+            target-benchmark/comparison.txt
+            target-benchmark/comparison-list.txt
+            target-benchmark/significant.txt
+            target-benchmark/critcmp-errors.txt
+            target-benchmark/gate.txt
+            target-benchmark/criterion/**/base/*.json
+            target-benchmark/criterion/**/pr/*.json
+          if-no-files-found: warn
+          retention-days: 14
+      - name: Clean up benchmark worktrees
+        if: ${{ always() }}
+        run: |
+          if [ -d "$BASE_DIRECTORY" ]; then git worktree remove --force "$BASE_DIRECTORY"; fi
+          if [ -d "$HEAD_DIRECTORY" ]; then git worktree remove --force "$HEAD_DIRECTORY"; fi
 
   audit:
     name: Dependency security and license policy

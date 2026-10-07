@@ -2,8 +2,12 @@
 
 ## [Unreleased]
 
-- Add dependency-free benchmarks for local reuse, allocation, warming, concurrent
+- Add Criterion benchmarks for local reuse, allocation, warming, concurrent
   returns, and remote draining, with small values and reusable buffers.
+- Compare benchmark baselines with critcmp in pull requests and retain
+  performance reports. Cache Miri's sysroot for each installed nightly compiler.
+- Give reusable CI a distinct concurrency group during releases and pin CI tool
+  versions. Point package metadata to the canonical `rylv/rylv-pool` repository.
 
 ## [0.1.0]
 

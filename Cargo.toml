@@ -5,7 +5,7 @@ edition = "2024"
 rust-version = "1.85"
 description = "Generic pooling with pluggable providers and thread-local storage"
 license = "MIT OR Apache-2.0"
-repository = "https://github.com/andresmargalef/rylv-pool"
+repository = "https://github.com/rylv/rylv-pool"
 readme = "README.md"
 autobenches = false
 exclude = [".github/", "docs/", "fuzz/", "Makefile", "deny.toml"]
@@ -14,6 +14,9 @@ categories = ["memory-management", "concurrency"]
 
 [dependencies]
 stable_deref_trait = "1.2"
+
+[dev-dependencies]
+criterion = { version = "0.7", default-features = false, features = ["cargo_bench_support"] }
 
 [[bench]]
 name = "pool"

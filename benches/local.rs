@@ -6,132 +6,98 @@ use std::{
     time::{Duration, Instant},
 };
 
+use criterion::{BenchmarkId, Criterion, Throughput};
 use rylv_pool::PoolProvider;
 
-use crate::{
-    Measurement, Runner,
-    support::{
-        BenchItem, CAPACITY, Guard, LOCAL_BATCH, PoolKey, acquire, clear_pool, take_existing,
-    },
+use crate::support::{
+    BenchItem, CAPACITY, Guard, LOCAL_BATCH, PoolKey, acquire, clear_pool, take_existing,
 };
 
 pub(super) fn run<T: BenchItem>(
-    runner: &mut Runner,
+    criterion: &mut Criterion,
     key: PoolKey<T>,
     miss_key: PoolKey<T, 0>,
     item_label: &str,
 ) {
-    runner.measure(
-        &format!("local/reuse/{item_label}"),
-        LOCAL_BATCH,
-        "op",
-        |iterations| {
-            clear_pool(key);
-            assert_eq!(key.warm(1, || Ok::<_, Infallible>(T::create())).unwrap(), 1);
-            let started = Instant::now();
-            for _ in 0..iterations {
-                for _ in 0..LOCAL_BATCH {
-                    let mut guard = black_box(
-                        Guard::acquire_with(key, || {
-                            panic!("local reuse must not invoke the factory");
-                        })
-                        .expect("prewarmed acquisition must succeed"),
-                    );
-                    guard.touch();
-                    drop(black_box(guard));
-                }
+    let mut reuse = criterion.benchmark_group("local/reuse");
+    reuse.throughput(Throughput::Elements(LOCAL_BATCH as u64));
+    reuse.bench_function(item_label, |bencher| {
+        clear_pool(key);
+        assert_eq!(key.warm(1, || Ok::<_, Infallible>(T::create())).unwrap(), 1);
+        bencher.iter(|| {
+            for _ in 0..LOCAL_BATCH {
+                let mut guard = black_box(
+                    Guard::acquire_with(key, || {
+                        panic!("local reuse must not invoke the factory");
+                    })
+                    .expect("prewarmed acquisition must succeed"),
+                );
+                guard.touch();
+                drop(black_box(guard));
             }
-            let elapsed = started.elapsed();
-            assert_eq!(clear_pool(key), 1);
-            Measurement {
-                elapsed,
-                batches: iterations,
-            }
-        },
-    );
+        });
+        assert_eq!(clear_pool(key), 1);
+    });
+    reuse.finish();
 
-    runner.measure(
-        &format!("local/miss/{item_label}"),
-        LOCAL_BATCH,
-        "op",
-        |iterations| {
-            clear_pool(miss_key);
-            let started = Instant::now();
-            for _ in 0..iterations {
-                for _ in 0..LOCAL_BATCH {
-                    let mut guard = black_box(acquire(miss_key));
-                    guard.touch();
-                    drop(black_box(guard));
-                }
+    let mut miss = criterion.benchmark_group("local/miss");
+    miss.throughput(Throughput::Elements(LOCAL_BATCH as u64));
+    miss.bench_function(item_label, |bencher| {
+        clear_pool(miss_key);
+        bencher.iter(|| {
+            for _ in 0..LOCAL_BATCH {
+                let mut guard = black_box(acquire(miss_key));
+                guard.touch();
+                drop(black_box(guard));
             }
-            let elapsed = started.elapsed();
-            assert_eq!(clear_pool(miss_key), 0);
-            Measurement {
-                elapsed,
-                batches: iterations,
-            }
-        },
-    );
+        });
+        assert_eq!(clear_pool(miss_key), 0);
+    });
+    miss.finish();
 
-    runner.measure(
-        &format!("alloc/box/{item_label}"),
-        LOCAL_BATCH,
-        "op",
-        |iterations| {
-            let started = Instant::now();
-            for _ in 0..iterations {
-                for _ in 0..LOCAL_BATCH {
-                    let mut value = black_box(Box::new(T::create()));
-                    value.touch();
-                    value.reset();
-                    drop(black_box(value));
-                }
+    let mut allocation = criterion.benchmark_group("alloc/box");
+    allocation.throughput(Throughput::Elements(LOCAL_BATCH as u64));
+    allocation.bench_function(item_label, |bencher| {
+        bencher.iter(|| {
+            for _ in 0..LOCAL_BATCH {
+                let mut value = black_box(Box::new(T::create()));
+                value.touch();
+                value.reset();
+                drop(black_box(value));
             }
-            Measurement {
-                elapsed: started.elapsed(),
-                batches: iterations,
-            }
-        },
-    );
+        });
+    });
+    allocation.finish();
 
-    runner.measure(
-        &format!("warm/full/{item_label}"),
-        LOCAL_BATCH,
-        "call",
-        |iterations| {
-            clear_pool(key);
-            assert_eq!(
-                key.warm(CAPACITY, || Ok::<_, Infallible>(T::create()))
-                    .unwrap(),
-                CAPACITY
-            );
-            let started = Instant::now();
-            for _ in 0..iterations {
-                for _ in 0..LOCAL_BATCH {
-                    let inserted = key
-                        .warm(CAPACITY, || -> Result<T, Infallible> {
-                            panic!("full warm must not invoke the factory");
-                        })
-                        .expect("warming a full pool must succeed");
-                    black_box(inserted);
-                }
+    let mut full = criterion.benchmark_group("warm/full");
+    full.throughput(Throughput::Elements(LOCAL_BATCH as u64));
+    full.bench_function(item_label, |bencher| {
+        clear_pool(key);
+        assert_eq!(
+            key.warm(CAPACITY, || Ok::<_, Infallible>(T::create()))
+                .unwrap(),
+            CAPACITY
+        );
+        bencher.iter(|| {
+            for _ in 0..LOCAL_BATCH {
+                let inserted = key
+                    .warm(CAPACITY, || -> Result<T, Infallible> {
+                        panic!("full warm must not invoke the factory");
+                    })
+                    .expect("warming a full pool must succeed");
+                black_box(inserted);
             }
-            let elapsed = started.elapsed();
-            assert_eq!(clear_pool(key), CAPACITY);
-            Measurement {
-                elapsed,
-                batches: iterations,
-            }
-        },
-    );
+        });
+        assert_eq!(clear_pool(key), CAPACITY);
+    });
+    full.finish();
 
+    let mut refill = criterion.benchmark_group("warm/refill");
     for count in [1, 32, CAPACITY] {
-        runner.measure(
-            &format!("warm/refill/{count}/{item_label}"),
-            count,
-            "entry",
-            |iterations| {
-                clear_pool(key);
+        refill.throughput(Throughput::Elements(count as u64));
+        refill.bench_function(BenchmarkId::new(count.to_string(), item_label), |bencher| {
+            clear_pool(key);
+            bencher.iter_custom(|iterations| {
                 let mut elapsed = Duration::ZERO;
                 for _ in 0..iterations {
                     let started = Instant::now();
@@ -144,12 +110,10 @@ pub(super) fn run<T: BenchItem>(
                         drop(take_existing(key));
                     }
                 }
-                assert_eq!(clear_pool(key), 0);
-                Measurement {
-                    elapsed,
-                    batches: iterations,
-                }
-            },
-        );
+                elapsed
+            });
+            assert_eq!(clear_pool(key), 0);
+        });
     }
+    refill.finish();
 }

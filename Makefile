@@ -6,11 +6,11 @@ MIRI_SEED ?= 0
 FUZZ_SECONDS ?= 60
 BENCH_ARGS ?=
 
-.PHONY: help check test test-release bench clippy fmt fmt-check doc msrv miri fuzz-build fuzz coverage audit deny verify prepare-publish
+.PHONY: help check test test-release bench ci-scripts clippy fmt fmt-check doc msrv miri fuzz-build fuzz coverage audit deny verify prepare-publish
 
 help:
 	@echo "check, test, test-release, clippy, fmt, fmt-check, doc, msrv"
-	@echo "bench (optional BENCH_ARGS='--samples 9 --iterations 2000 warm/')"
+	@echo "bench (optional BENCH_ARGS='warm/ --sample-size 50 --measurement-time 3'), ci-scripts"
 	@echo "miri (nightly + Miri), fuzz-build/fuzz (nightly + cargo-fuzz)"
 	@echo "coverage (cargo-llvm-cov + llvm-tools-preview), audit, deny"
 	@echo "verify, prepare-publish"
@@ -27,6 +27,9 @@ test-release:
 
 bench:
 	cargo bench --locked --bench pool -- $(BENCH_ARGS)
+
+ci-scripts:
+	python3 -m unittest discover -s .github/scripts -p 'test_*.py'
 
 clippy:
 	cargo clippy --locked --all-features --all-targets -- -D warnings
@@ -76,6 +79,7 @@ verify:
 	$(MAKE) clippy
 	$(MAKE) test
 	$(MAKE) doc
+	$(MAKE) ci-scripts
 
 prepare-publish:
 	$(MAKE) verify

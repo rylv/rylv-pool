@@ -55,18 +55,19 @@ crate's unit, integration, and documentation tests.
 
 ## Benchmarks
 
-`make bench` runs the pool benchmarks in the optimized bench profile without
-additional dependencies. They cover local reuse, misses, prewarming, remote
+`make bench` runs Criterion benchmarks in the optimized bench profile. Criterion
+is a development dependency. They cover local reuse, misses, prewarming, remote
 returns, and draining, with small values and reusable buffers. For example:
 
 ```sh
-make bench BENCH_ARGS='--samples 9 --iterations 2000 warm/'
+make bench BENCH_ARGS='warm/ --sample-size 50 --measurement-time 3'
 make bench BENCH_ARGS='--list'
 ```
 
 See [benchmark methodology](docs/benchmarks.md) for the scenarios, timing units,
 and comparison limits. Normal tests run the scenarios as smoke checks without
-reporting timings; CI has no performance threshold.
+reporting timings. Pull-request CI compares baselines with critcmp and fails on
+mean slowdowns greater than 15%; the threshold is configurable.
 
 ## License
 

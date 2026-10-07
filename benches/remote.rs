@@ -16,10 +16,9 @@ use std::{
     time::{Duration, Instant},
 };
 
-use crate::{
-    Measurement, Runner,
-    support::{BenchItem, CAPACITY, Guard, PoolKey, acquire, clear_pool},
-};
+use criterion::{BenchmarkId, Criterion, Throughput};
+
+use crate::support::{BenchItem, CAPACITY, Guard, PoolKey, acquire, clear_pool};
 
 enum Command<T: BenchItem> {
     Return(Vec<Guard<T>>),
@@ -45,11 +44,13 @@ struct Workers<T: BenchItem> {
 impl<T: BenchItem> Workers<T> {
     fn new(count: usize) -> Self {
         let start = Arc::new(Barrier::new(count + 1));
+        let finish = Arc::new(Barrier::new(count));
         let workers = (0..count)
             .map(|_| {
                 let (commands, received) = mpsc::channel::<Command<T>>();
                 let (acknowledgement, finished) = mpsc::channel();
                 let start = Arc::clone(&start);
+                let finish = Arc::clone(&finish);
                 let thread = thread::spawn(move || {
                     while let Ok(Command::Return(mut guards)) = received.recv() {
                         // All guards are received before timing begins. The
@@ -61,8 +62,10 @@ impl<T: BenchItem> Workers<T> {
                             drop(guard);
                         }
                         let finished = Instant::now();
-                        // Preserve the allocated Vec until after the timestamp
-                        // so freeing the transport buffer is not measured.
+                        // Wait until every producer has recorded its finish,
+                        // so freeing transport buffers and sending acknowledgements
+                        // happens after the complete measured return window.
+                        finish.wait();
                         drop(guards);
                         if acknowledgement
                             .send(ReturnWindow { started, finished })
@@ -161,67 +164,77 @@ fn validate_return<T: BenchItem>(guard: &mut Guard<T>, addresses: &[usize]) {
     black_box(&mut **guard);
 }
 
-pub(super) fn run<T: BenchItem>(runner: &mut Runner, key: PoolKey<T>, item_label: &str) {
+pub(super) fn run<T: BenchItem>(criterion: &mut Criterion, key: PoolKey<T>, item_label: &str) {
+    let mut returns = criterion.benchmark_group("remote/return");
     for producer_count in [1, 2, 4] {
         // Threads and synchronization objects persist for every sample of this
-        // case and are created outside both warmup and measured batches.
+        // case. Lazy creation also avoids creating them for filtered/listed
+        // cases, and remains outside Criterion's custom measurement callback.
         let mut workers = None;
-        runner.measure(
-            &format!("remote/return/{producer_count}/{item_label}"),
-            producer_count * CAPACITY,
-            "entry",
-            |iterations| {
+        returns.throughput(Throughput::Elements(
+            u64::try_from(producer_count * CAPACITY).expect("return batch size must fit in u64"),
+        ));
+        returns.bench_with_input(
+            BenchmarkId::new(producer_count.to_string(), item_label),
+            &producer_count,
+            |bencher, &producer_count| {
                 let workers = workers.get_or_insert_with(|| Workers::new(producer_count));
-                let mut elapsed = Duration::ZERO;
-                for _ in 0..iterations {
-                    let addresses = workers.prepare(key, CAPACITY);
-                    elapsed += workers.return_all();
-                    let mut guard = require_returned(key);
-                    validate_return(&mut guard, &addresses);
-                    drop(guard);
-                    clear_pool(key);
-                }
-                Measurement {
-                    elapsed,
-                    batches: iterations,
-                }
+                bencher.iter_custom(|iterations| {
+                    let mut elapsed = Duration::ZERO;
+                    for _ in 0..iterations {
+                        let addresses = workers.prepare(key, CAPACITY);
+                        elapsed += workers.return_all();
+                        let mut guard = require_returned(key);
+                        validate_return(&mut guard, &addresses);
+                        drop(guard);
+                        clear_pool(key);
+                    }
+                    // Return the total duration for all requested batches.
+                    // Criterion handles per-batch analysis; throughput records
+                    // the total number of entries in each batch.
+                    elapsed
+                });
             },
         );
     }
+    returns.finish();
 
+    let mut drains = criterion.benchmark_group("remote/drain");
     let mut workers = None;
     for entry_count in [1, CAPACITY, CAPACITY * 4] {
-        runner.measure(
-            &format!("remote/drain/{entry_count}/{item_label}"),
-            entry_count,
-            "entry",
-            |iterations| {
+        drains.throughput(Throughput::Elements(
+            u64::try_from(entry_count).expect("drain batch size must fit in u64"),
+        ));
+        drains.bench_with_input(
+            BenchmarkId::new(entry_count.to_string(), item_label),
+            &entry_count,
+            |bencher, &entry_count| {
                 let workers = workers.get_or_insert_with(|| Workers::new(1));
-                let mut elapsed = Duration::ZERO;
-                for _ in 0..iterations {
-                    let addresses = workers.prepare(key, entry_count);
-                    // Receiving all acknowledgements establishes that every
-                    // entry is in the remote queue before the origin acquires.
-                    workers.return_all();
-                    let started = Instant::now();
-                    let result = Guard::acquire_with(key, || {
-                        panic!("remote drain must not invoke the factory")
-                    });
-                    elapsed += started.elapsed();
-                    // Time only the first acquisition: it detaches the batch,
-                    // retains at most CAPACITY entries, and destroys overflow.
-                    // Mutation, assertions, guard return, and cleanup follow
-                    // the timestamp.
-                    let mut guard = result.expect("remote drain must return an existing entry");
-                    validate_return(&mut guard, &addresses);
-                    drop(guard);
-                    clear_pool(key);
-                }
-                Measurement {
-                    elapsed,
-                    batches: iterations,
-                }
+                bencher.iter_custom(|iterations| {
+                    let mut elapsed = Duration::ZERO;
+                    for _ in 0..iterations {
+                        let addresses = workers.prepare(key, entry_count);
+                        // Receiving all acknowledgements establishes that every
+                        // entry is in the remote queue before the origin acquires.
+                        workers.return_all();
+                        let started = Instant::now();
+                        let result = Guard::acquire_with(key, || {
+                            panic!("remote drain must not invoke the factory")
+                        });
+                        elapsed += started.elapsed();
+                        // Time only the first acquisition: it detaches the batch,
+                        // retains at most CAPACITY entries, and destroys overflow.
+                        // Mutation, assertions, guard return, and cleanup follow
+                        // the timestamp.
+                        let mut guard = result.expect("remote drain must return an existing entry");
+                        validate_return(&mut guard, &addresses);
+                        drop(guard);
+                        clear_pool(key);
+                    }
+                    elapsed
+                });
             },
         );
     }
+    drains.finish();
 }
