@@ -1,14 +1,16 @@
 .DEFAULT_GOAL := help
 
 COVERAGE_MIN_LINES ?= 95
-COVERAGE_IGNORE = (^|/)(tests|fuzz)/|/tests\.rs$$
+COVERAGE_IGNORE = (^|/)(tests|fuzz|benches)/|/tests\.rs$$
 MIRI_SEED ?= 0
 FUZZ_SECONDS ?= 60
+BENCH_ARGS ?=
 
-.PHONY: help check test test-release clippy fmt fmt-check doc msrv miri fuzz-build fuzz coverage audit deny verify prepare-publish
+.PHONY: help check test test-release bench clippy fmt fmt-check doc msrv miri fuzz-build fuzz coverage audit deny verify prepare-publish
 
 help:
 	@echo "check, test, test-release, clippy, fmt, fmt-check, doc, msrv"
+	@echo "bench (optional BENCH_ARGS='--samples 9 --iterations 2000 warm/')"
 	@echo "miri (nightly + Miri), fuzz-build/fuzz (nightly + cargo-fuzz)"
 	@echo "coverage (cargo-llvm-cov + llvm-tools-preview), audit, deny"
 	@echo "verify, prepare-publish"
@@ -22,6 +24,9 @@ test:
 
 test-release:
 	cargo test --locked --release --all-features --all-targets
+
+bench:
+	cargo bench --locked --bench pool -- $(BENCH_ARGS)
 
 clippy:
 	cargo clippy --locked --all-features --all-targets -- -D warnings

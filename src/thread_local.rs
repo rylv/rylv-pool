@@ -3,17 +3,17 @@
 use std::{
     cell::UnsafeCell,
     ops::{Deref, DerefMut},
-    ptr::NonNull,
-    sync::{
-        Arc, Weak,
-        atomic::{AtomicPtr, Ordering},
-    },
+    sync::{Arc, Weak, atomic::AtomicPtr},
     thread::{self, LocalKey, ThreadId},
 };
 
 use stable_deref_trait::StableDeref;
 
 use super::{PoolError, PoolGuard, PoolItem, PoolProvider, core::Storage};
+
+mod remote_returns;
+
+use remote_returns::{DetachedReturns, RemoteReturns};
 
 struct Entry<T: PoolItem, const N: usize> {
     value: T,
@@ -58,82 +58,6 @@ impl<T: PoolItem, const N: usize> DerefMut for FixedThreadLocalEntry<T, N> {
 
 // SAFETY: the value lives in a Box and the entry never replaces the allocation.
 unsafe impl<T: PoolItem, const N: usize> StableDeref for FixedThreadLocalEntry<T, N> {}
-
-/// Intrusive MPSC stack. Foreign threads are producers and the origin thread
-/// is its only consumer.
-struct RemoteReturns<T: PoolItem, const N: usize> {
-    head: AtomicPtr<Entry<T, N>>,
-}
-
-impl<T: PoolItem, const N: usize> RemoteReturns<T, N> {
-    const fn new() -> Self {
-        Self {
-            head: AtomicPtr::new(std::ptr::null_mut()),
-        }
-    }
-
-    fn push(&self, entry: Box<Entry<T, N>>) {
-        let node = Box::into_raw(entry);
-        let mut head = self.head.load(Ordering::Acquire);
-        loop {
-            // SAFETY: this producer exclusively owns `node` until the
-            // successful compare-exchange publishes it.
-            unsafe {
-                (*node).metadata.remote_next.store(head, Ordering::Relaxed);
-            }
-            match self
-                .head
-                .compare_exchange_weak(head, node, Ordering::Release, Ordering::Acquire)
-            {
-                Ok(_) => return,
-                Err(current) => head = current,
-            }
-        }
-    }
-
-    fn take_all(&self) -> RemoteReturnBatch<T, N> {
-        RemoteReturnBatch {
-            next: self.head.swap(std::ptr::null_mut(), Ordering::Acquire),
-        }
-    }
-}
-
-impl<T: PoolItem, const N: usize> Drop for RemoteReturns<T, N> {
-    fn drop(&mut self) {
-        // Reaching Drop means no producer can upgrade its Weak handle.
-        drop(self.take_all());
-    }
-}
-
-struct RemoteReturnBatch<T: PoolItem, const N: usize> {
-    next: *mut Entry<T, N>,
-}
-
-impl<T: PoolItem, const N: usize> Iterator for RemoteReturnBatch<T, N> {
-    type Item = Box<Entry<T, N>>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        let mut current = NonNull::new(self.next)?;
-        // SAFETY: nodes originated in Box::into_raw and this detached list has
-        // exactly one consumer.
-        unsafe {
-            let metadata = &mut current.as_mut().metadata;
-            self.next = metadata.remote_next.load(Ordering::Relaxed);
-            metadata
-                .remote_next
-                .store(std::ptr::null_mut(), Ordering::Relaxed);
-            Some(Box::from_raw(current.as_ptr()))
-        }
-    }
-}
-
-impl<T: PoolItem, const N: usize> Drop for RemoteReturnBatch<T, N> {
-    fn drop(&mut self) {
-        for entry in self.by_ref() {
-            drop(entry);
-        }
-    }
-}
 
 impl<T: PoolItem, const N: usize> ThreadLocalMetadata<T, N> {
     #[inline(always)]
@@ -207,7 +131,7 @@ impl<T: PoolItem, const N: usize> FixedThreadLocalPool<T, N> {
     }
 
     #[inline(always)]
-    fn take_remote_returns(&self) -> RemoteReturnBatch<T, N> {
+    fn take_remote_returns(&self) -> DetachedReturns<T, N> {
         // SAFETY: the shared access reaches only the atomic remote queue.
         unsafe { (&*self.0.get()).remote.take_all() }
     }

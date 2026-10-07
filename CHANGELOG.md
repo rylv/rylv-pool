@@ -2,6 +2,9 @@
 
 ## [Unreleased]
 
+- Add dependency-free benchmarks for local reuse, allocation, warming, concurrent
+  returns, and remote draining, with small values and reusable buffers.
+
 ## [0.1.0]
 
 - Introduce `PoolItem`, `PoolProvider`, and `PoolGuard` with provider-selected,

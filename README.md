@@ -41,20 +41,32 @@ scratch.0.extend_from_slice(b"reusable storage");
 
 ## Testing and CI
 
-The CI configuration is based on the
-[rylv-metrics workflows](https://github.com/rylv/rylv-metrics/tree/master/.github/workflows).
-It includes stable and MSRV builds on Linux/macOS/Windows, debug/release tests,
+CI includes stable and MSRV builds on Linux/macOS/Windows, debug/release tests,
 Clippy, formatting, documentation, coverage artifacts, Miri, fuzzing, dependency
 security and license checks, semver checks, and tag-driven releases.
 
-The coverage gate targets at least 95% of production lines. This target has not
-been measured: the suite and workflows were written without executing tests or
-checks. See [CI setup](docs/ci.md) for commands, artifacts, and required GitHub
+The coverage gate requires at least 95% of production lines. See
+[CI setup](docs/ci.md) for commands, artifacts, and required GitHub
 configuration, and [test coverage map](docs/testing.md) for the scenarios.
 
 `make verify` runs the normal local checks. `make coverage`, `make miri`, and
 `make fuzz` opt into the additional tools. `cargo test --locked` runs the root
 crate's unit, integration, and documentation tests.
+
+## Benchmarks
+
+`make bench` runs the pool benchmarks in the optimized bench profile without
+additional dependencies. They cover local reuse, misses, prewarming, remote
+returns, and draining, with small values and reusable buffers. For example:
+
+```sh
+make bench BENCH_ARGS='--samples 9 --iterations 2000 warm/'
+make bench BENCH_ARGS='--list'
+```
+
+See [benchmark methodology](docs/benchmarks.md) for the scenarios, timing units,
+and comparison limits. Normal tests run the scenarios as smoke checks without
+reporting timings; CI has no performance threshold.
 
 ## License
 

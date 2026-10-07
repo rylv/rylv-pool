@@ -1,9 +1,9 @@
 # Test coverage map
 
 This suite aims to cover the pool's lifecycle and failure paths without exposing
-private fields or inspection helpers in the production API. No tests or checks
-have been executed while preparing these additions. The coverage percentage is
-unknown until CI or a local coverage run executes them.
+private fields or inspection helpers in the production API. `make coverage`
+generates the current production coverage report and enforces the 95% line
+threshold. Test, fuzz, and benchmark sources are excluded from that calculation.
 
 ## Unit tests
 
@@ -33,6 +33,20 @@ unknown until CI or a local coverage run executes them.
 Stateful tests use fresh owner threads or test-specific TLS keys. Concurrency
 scenarios use barriers and joins; they do not infer completion from timing or
 sleep durations. Counters are observed after the relevant synchronization.
+
+## Benchmark smoke scenarios
+
+`benches/pool.rs` uses the public API and a custom standard-library harness.
+`cargo test --all-targets` runs each selected scenario with a small workload and
+checks its lifecycle invariants without reporting timings. The benchmark target
+is included in normal all-target checks, Clippy, and formatting.
+
+`make bench` enables optimized measurements for local reuse and misses,
+prewarming, concurrent remote returns, and draining retained and overflow entries.
+Each scenario runs with a small value and a reusable buffer. See
+[benchmark methodology](benchmarks.md) for the full case list and comparison
+limits. Performance measurements do not replace the deterministic tests or set
+a CI threshold.
 
 ## Compile-time contracts
 

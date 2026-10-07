@@ -7,12 +7,17 @@ description = "Generic pooling with pluggable providers and thread-local storage
 license = "MIT OR Apache-2.0"
 repository = "https://github.com/andresmargalef/rylv-pool"
 readme = "README.md"
+autobenches = false
 exclude = [".github/", "docs/", "fuzz/", "Makefile", "deny.toml"]
 keywords = ["pool", "thread-local", "reuse"]
 categories = ["memory-management", "concurrency"]
 
 [dependencies]
 stable_deref_trait = "1.2"
+
+[[bench]]
+name = "pool"
+harness = false
 
 [lints.rust]
 unexpected_cfgs = { level = "warn", check-cfg = ["cfg(miri)"] }
