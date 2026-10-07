@@ -195,8 +195,8 @@ jobs:
           path: fuzz/corpus
           key: fuzz-corpus-${{ runner.os }}-${{ github.run_id }}
           restore-keys: fuzz-corpus-${{ runner.os }}-
-      - run: cargo fuzz build pool_lifecycle
-      - run: cargo fuzz run pool_lifecycle -- -max_total_time=60 -max_len=64 -timeout=10 -rss_limit_mb=1024
+      - run: cargo fuzz build pool_lifecycle --target x86_64-unknown-linux-gnu
+      - run: cargo fuzz run pool_lifecycle --target x86_64-unknown-linux-gnu -- -max_total_time=60 -max_len=64 -timeout=10 -rss_limit_mb=1024
       - name: Upload failure artifacts and generated lockfile
         if: ${{ !cancelled() }}
         uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
