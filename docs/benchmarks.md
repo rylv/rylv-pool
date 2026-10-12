@@ -44,7 +44,7 @@ every CI platform and profile.
 
 ## Cases
 
-Every case below has `/small` and `/buffer` suffixes, for 26 scenarios in total.
+Every case below has `/small` and `/buffer` suffixes, for 30 scenarios in total.
 The small value contains 64 bytes and has an empty reset operation. The buffer
 value reserves 1 KiB, writes 64 bytes when used, and retains its allocation on
 reset by clearing its length. The allocation reference also performs the same
@@ -53,6 +53,8 @@ touch and reset operations before dropping its plain `Box`.
 | Case prefix | Measured operation | Elements per timed batch |
 | --- | --- | --- |
 | `local/reuse` | Acquire and drop guards from a prewarmed pool | 256 operations |
+| `local/deref_mut/guard` | Repeatedly mutate `T` through an already acquired guard | 256 accesses |
+| `local/deref_mut/direct` | Repeatedly mutate `T` through an existing `&mut T` as a reference cost | 256 accesses |
 | `local/miss` | Acquire through a factory and drop with no retained capacity | 256 operations |
 | `alloc/box` | Allocate and drop plain `Box` values as a reference cost | 256 operations |
 | `warm/full` | Call `warm` when the pool is already full | 256 calls |
@@ -92,6 +94,14 @@ origin's first acquisition. That acquisition processes the batch, retains entrie
 up to capacity, and destroys overflow. Returning the acquired guard and cleaning
 up retained entries happen after timing. Publishing the batch is measured
 separately by the remote return cases.
+
+The `local/deref_mut` cases acquire one guard before timing and return it after
+timing. Each access passes the mutable reference through `black_box` and
+increments one value byte or word. The `direct` case starts with a mutable
+reference obtained from the same guard before timing; it provides a reference
+cost for the mutation loop. Compare the `guard` case across revisions to
+assess changes to the guard's `DerefMut`. These cases exclude acquisition and
+reset from timing.
 
 Refill and drain cases timestamp each batch individually. Timer overhead is not
 subtracted and can be significant for one-entry batches; compare the same cases

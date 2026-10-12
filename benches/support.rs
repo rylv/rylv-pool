@@ -17,6 +17,8 @@ pub(super) type Guard<T, const N: usize = CAPACITY> = FixedThreadLocalPoolGuard<
 pub(super) trait BenchItem: PoolItem {
     fn create() -> Self;
     fn touch(&mut self);
+    fn prepare_deref_mut(&mut self) {}
+    fn mutate_deref_mut(&mut self);
 }
 
 pub(super) struct Small([u64; 8]);
@@ -33,6 +35,10 @@ impl BenchItem for Small {
     fn touch(&mut self) {
         self.0[0] = self.0[0].wrapping_add(1);
         black_box(&self.0);
+    }
+
+    fn mutate_deref_mut(&mut self) {
+        self.0[0] = self.0[0].wrapping_add(1);
     }
 }
 
@@ -52,6 +58,14 @@ impl BenchItem for Buffer {
     fn touch(&mut self) {
         self.0.extend_from_slice(&[7; 64]);
         black_box(self.0.as_slice());
+    }
+
+    fn prepare_deref_mut(&mut self) {
+        self.0.push(0);
+    }
+
+    fn mutate_deref_mut(&mut self) {
+        self.0[0] = self.0[0].wrapping_add(1);
     }
 }
 

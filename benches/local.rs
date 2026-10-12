@@ -3,6 +3,7 @@
 use std::{
     convert::Infallible,
     hint::black_box,
+    ops::DerefMut,
     time::{Duration, Instant},
 };
 
@@ -39,6 +40,35 @@ pub(super) fn run<T: BenchItem>(
         assert_eq!(clear_pool(key), 1);
     });
     reuse.finish();
+
+    let mut deref_mut = criterion.benchmark_group("local/deref_mut");
+    deref_mut.throughput(Throughput::Elements(LOCAL_BATCH as u64));
+    deref_mut.bench_function(BenchmarkId::new("guard", item_label), |bencher| {
+        clear_pool(key);
+        let mut guard = acquire(key);
+        guard.prepare_deref_mut();
+        bencher.iter(|| {
+            for _ in 0..LOCAL_BATCH {
+                black_box(&mut guard).deref_mut().mutate_deref_mut();
+            }
+        });
+        drop(guard);
+        assert_eq!(clear_pool(key), 1);
+    });
+    deref_mut.bench_function(BenchmarkId::new("direct", item_label), |bencher| {
+        clear_pool(key);
+        let mut guard = acquire(key);
+        guard.prepare_deref_mut();
+        let value: &mut T = &mut guard;
+        bencher.iter(|| {
+            for _ in 0..LOCAL_BATCH {
+                black_box(&mut *value).mutate_deref_mut();
+            }
+        });
+        drop(guard);
+        assert_eq!(clear_pool(key), 1);
+    });
+    deref_mut.finish();
 
     let mut miss = criterion.benchmark_group("local/miss");
     miss.throughput(Throughput::Elements(LOCAL_BATCH as u64));
