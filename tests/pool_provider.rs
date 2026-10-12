@@ -6,7 +6,7 @@ use std::{
     },
 };
 
-use rylv_pool::{PoolError, PoolGuard, PoolItem, PoolProvider};
+use rylv_pool::{FixedThreadLocalPoolGuard, PoolError, PoolGuard, PoolItem, PoolProvider};
 
 const CAPACITY: usize = 2;
 
@@ -115,6 +115,13 @@ impl PoolProvider<Item> for QueuePoolProvider {
 }
 
 type Guard = PoolGuard<Item, QueuePoolProvider>;
+
+#[test]
+fn guard_is_sync_when_its_components_are_sync() {
+    fn require_sync<T: Sync>() {}
+    require_sync::<Guard>();
+    require_sync::<FixedThreadLocalPoolGuard<Item, 1>>();
+}
 
 fn item_address(item: &Item) -> usize {
     std::ptr::from_ref(item).addr()
