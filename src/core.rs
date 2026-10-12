@@ -5,6 +5,7 @@
 //! synchronization strategy.
 
 use std::{
+    ptr::NonNull,
     convert::Infallible,
     mem::ManuallyDrop,
     ops::{Deref, DerefMut},
@@ -222,6 +223,10 @@ impl<E, const N: usize> Storage<E, N> {
 /// let duplicate = guard.clone();
 /// ```
 pub struct PoolGuard<T: PoolItem, P: PoolProvider<T>> {
+    /// Derivado UNA única vez en acquire, desde el &mut exclusivo del entry.
+    /// Todos los accesos al valor derivan desde acá (única cadena de
+    /// aliasing): 1 load por acceso en vez de 2 (guard → Box → value).
+    value_ptr: NonNull<T>,
     node: ManuallyDrop<P::Entry>,
     provider: P,
 }
@@ -263,12 +268,14 @@ impl<T: PoolItem, P: PoolProvider<T>> PoolGuard<T, P> {
     where
         F: FnOnce() -> Result<T, E>,
     {
-        Ok(Self {
-            node: ManuallyDrop::new(
-                catch_operation(|| provider.take(create)).map_err(PoolError::Panic)??,
-            ),
-            provider,
-        })
+        let mut node = ManuallyDrop::new(
+            catch_operation(|| provider.take(create)).map_err(PoolError::Panic)??,
+        );
+        // Derivación única del puntero al valor, desde el &mut exclusivo del
+        // entry recién tomado. La alocación del Box no se mueve después.
+        // SAFETY: el valor existe y es válido mientras el guard viva.
+        let value = NonNull::from(&mut **node);
+        Ok(Self { value_ptr: value, node, provider })
     }
 }
 
@@ -277,19 +284,30 @@ impl<T: PoolItem, P: PoolProvider<T>> Deref for PoolGuard<T, P> {
 
     #[inline(always)]
     fn deref(&self) -> &Self::Target {
-        self.node.deref()
+        // SAFETY: el puntero fue derivado del &mut exclusivo del entry en el
+        // constructor; el Box no reemplaza su alocación mientras el guard vive.
+        unsafe { self.value_ptr.as_ref() }
     }
 }
 
 impl<T: PoolItem, P: PoolProvider<T>> DerefMut for PoolGuard<T, P> {
     #[inline(always)]
     fn deref_mut(&mut self) -> &mut Self::Target {
-        self.node.deref_mut()
+        // SAFETY: acceso exclusivo garantizado por el protocolo del pool
+        // (el entry está exclusivamente en este guard) y derivado del mismo
+        // NonNull que deref (única cadena de aliasing).
+        unsafe { self.value_ptr.as_mut() }
     }
 }
 
 // SAFETY: P::Entry implements StableDeref and the guard never replaces it.
 unsafe impl<T: PoolItem, P: PoolProvider<T>> StableDeref for PoolGuard<T, P> {}
+
+// SAFETY: el guard es dueño exclusivo del entry (protocolo take/return del
+// pool) y T: PoolItem: Send. El NonNull cacheado apunta al valor dentro del
+// Box del entry, que viaja con el guard — moverlo entre threads no invalida
+// nada (la alocación del heap es thread-independiente).
+unsafe impl<T: PoolItem, P: PoolProvider<T>> Send for PoolGuard<T, P> {}
 
 impl<T: PoolItem, P: PoolProvider<T>> Drop for PoolGuard<T, P> {
     #[inline(always)]
@@ -297,7 +315,9 @@ impl<T: PoolItem, P: PoolProvider<T>> Drop for PoolGuard<T, P> {
         // SAFETY: `node` is initialized by every constructor, `PoolGuard`
         // cannot be reused after `Drop` starts, and this is its only take.
         let mut node = unsafe { ManuallyDrop::take(&mut self.node) };
-        node.reset();
+        // SAFETY: reset por el MISMO NonNull cacheado — única cadena de
+        // derivación de referencias al valor (consistencia de aliasing).
+        unsafe { self.value_ptr.as_mut() }.reset();
 
         if let Err(node) = self.provider.return_entry(node) {
             discard_entry(node);
