@@ -10,7 +10,8 @@ use std::{
 };
 
 use rylv_pool::{
-    FixedThreadLocalPool, FixedThreadLocalPoolGuard, PoolError, PoolGuard, PoolItem, PoolProvider,
+    DiscardEntry, FixedThreadLocalPool, FixedThreadLocalPoolGuard, PoolError, PoolGuard, PoolItem,
+    PoolProvider,
 };
 
 #[derive(Default)]
@@ -134,13 +135,13 @@ fn zero_capacity_rejects_local_and_remote_returns_after_reset() {
 struct RejectProvider;
 
 impl PoolProvider<Item> for RejectProvider {
-    type Entry = Box<Item>;
+    type Entry = DiscardEntry<Item>;
 
     fn take<F, E>(&self, create: F) -> Result<Self::Entry, PoolError<E>>
     where
         F: FnOnce() -> Result<Item, E>,
     {
-        PoolError::catch(|| create().map(Box::new))
+        PoolError::catch(|| create().map(Box::new).map(DiscardEntry::from))
     }
 
     fn return_entry(&self, entry: Self::Entry) -> Result<(), Self::Entry> {

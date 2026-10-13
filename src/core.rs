@@ -1,14 +1,12 @@
 //! Provider-independent pooling primitives.
 //!
-//! [`PoolProvider`] deliberately exposes only the lifecycle operations needed
-//! by [`PoolGuard`]. Providers choose their own storage, identity, routing, and
-//! synchronization strategy.
+//! [`PoolProvider`] chooses storage and acquisition; [`PoolEntry`] carries the
+//! return route used by [`PoolGuard`].
 
 use std::{
     convert::Infallible,
-    mem::ManuallyDrop,
+    marker::PhantomData,
     ops::{Deref, DerefMut},
-    ptr::NonNull,
 };
 
 use stable_deref_trait::StableDeref;
@@ -33,11 +31,59 @@ pub trait PoolItem: Send + 'static {
     fn reset(&mut self);
 }
 
-/// Supplies complete take, return, and warming operations for a pool.
+/// An address-stable entry that routes itself back to its origin after reset.
 ///
-/// The provider owns all policy decisions. It may use a queue, thread-local
-/// storage, sharding, remote-return queues, or another implementation without
-/// exposing those concepts through this trait.
+/// The guard calls this method exactly once. Implementations must release any
+/// pool access before destroying a rejected entry, so its destructor may
+/// reenter the pool safely.
+pub trait PoolEntry<T: PoolItem>: DerefMut<Target = T> + StableDeref + Send + 'static {
+    /// Return this entry to its origin, or destroy it if it cannot be retained.
+    fn return_to_pool(self);
+}
+
+/// A boxed entry that is intentionally discarded when its guard is dropped.
+///
+/// Providers that retain entries should define their own [`PoolEntry`] type.
+pub struct DiscardEntry<T: PoolItem>(Box<T>);
+
+impl<T: PoolItem> From<Box<T>> for DiscardEntry<T> {
+    #[inline]
+    fn from(value: Box<T>) -> Self {
+        Self(value)
+    }
+}
+
+impl<T: PoolItem> Deref for DiscardEntry<T> {
+    type Target = T;
+
+    #[inline]
+    fn deref(&self) -> &T {
+        &self.0
+    }
+}
+
+impl<T: PoolItem> DerefMut for DiscardEntry<T> {
+    #[inline]
+    fn deref_mut(&mut self) -> &mut T {
+        &mut self.0
+    }
+}
+
+// SAFETY: the value stays in the Box when the entry moves.
+unsafe impl<T: PoolItem> StableDeref for DiscardEntry<T> {}
+
+impl<T: PoolItem> PoolEntry<T> for DiscardEntry<T> {
+    #[inline]
+    fn return_to_pool(self) {
+        drop(self);
+    }
+}
+
+/// Supplies take, direct return, and warming operations for a pool.
+///
+/// The entry carries the guard's return route. Providers may use a queue,
+/// thread-local storage, sharding, or another implementation without exposing
+/// those concepts through the guard.
 ///
 /// # Reentrancy
 ///
@@ -65,6 +111,9 @@ pub trait PoolProvider<T: PoolItem>: Send + 'static {
     /// # impl std::ops::DerefMut for InlineEntry {
     /// #     fn deref_mut(&mut self) -> &mut Item { &mut self.0 }
     /// # }
+    /// # impl rylv_pool::PoolEntry<Item> for InlineEntry {
+    /// #     fn return_to_pool(self) {}
+    /// # }
     /// struct Provider;
     /// impl PoolProvider<Item> for Provider {
     ///     type Entry = InlineEntry;
@@ -79,7 +128,7 @@ pub trait PoolProvider<T: PoolItem>: Send + 'static {
     /// #   where F: FnMut() -> Result<Item, E> { Ok(0) }
     /// }
     /// ```
-    type Entry: DerefMut<Target = T> + StableDeref + Send + 'static;
+    type Entry: PoolEntry<T>;
 
     /// Take a reusable entry, invoking `create` only on a pool miss.
     ///
@@ -169,7 +218,7 @@ impl<E, const N: usize> Storage<E, N> {
     }
 }
 
-/// Exclusive, address-stable guard returned by a [`PoolProvider`].
+/// Exclusive, address-stable guard over a self-returning [`PoolEntry`].
 ///
 /// # Address stability
 ///
@@ -222,23 +271,21 @@ impl<E, const N: usize> Storage<E, N> {
 /// let guard = FixedThreadLocalPoolGuard::acquire(&POOL).unwrap();
 /// let duplicate = guard.clone();
 /// ```
-pub struct PoolGuard<T: PoolItem, P: PoolProvider<T>> {
-    /// Derivado UNA única vez en acquire, desde el &mut exclusivo del entry.
-    /// Todos los accesos al valor derivan desde acá (única cadena de
-    /// aliasing): 1 load por acceso en vez de 2 (guard → Box → value).
-    value_ptr: NonNull<T>,
-    node: ManuallyDrop<P::Entry>,
-    provider: P,
+pub struct PoolGuard<T: PoolItem, E: PoolEntry<T>> {
+    node: Option<E>,
+    item: PhantomData<T>,
 }
 
-impl<T: PoolItem, P: PoolProvider<T>> PoolGuard<T, P> {
+impl<T: PoolItem, E: PoolEntry<T>> PoolGuard<T, E> {
     /// Acquire a value through the supplied provider.
     ///
     /// # Errors
     ///
     /// Returns a captured panic if acquisition or the default factory unwinds.
     #[inline(always)]
-    pub fn acquire(provider: P) -> Result<Self, PoolError<Infallible>>
+    pub fn acquire<P: PoolProvider<T, Entry = E>>(
+        provider: P,
+    ) -> Result<Self, PoolError<Infallible>>
     where
         T: Default,
     {
@@ -251,8 +298,9 @@ impl<T: PoolItem, P: PoolProvider<T>> PoolGuard<T, P> {
     ///
     /// Returns a captured panic if acquisition or the factory unwinds.
     #[inline(always)]
-    pub fn acquire_with<F>(provider: P, create: F) -> Result<Self, PoolError<Infallible>>
+    pub fn acquire_with<P, F>(provider: P, create: F) -> Result<Self, PoolError<Infallible>>
     where
+        P: PoolProvider<T, Entry = E>,
         F: FnOnce() -> T,
     {
         Self::try_acquire_with(provider, || Ok::<T, Infallible>(create()))
@@ -264,84 +312,56 @@ impl<T: PoolItem, P: PoolProvider<T>> PoolGuard<T, P> {
     ///
     /// Returns the factory error or a captured panic without creating a guard.
     #[inline(always)]
-    pub fn try_acquire_with<F, E>(provider: P, create: F) -> Result<Self, PoolError<E>>
+    #[allow(clippy::needless_pass_by_value)] // Keep the consuming acquisition API.
+    pub fn try_acquire_with<P, F, FactoryError>(
+        provider: P,
+        create: F,
+    ) -> Result<Self, PoolError<FactoryError>>
     where
-        F: FnOnce() -> Result<T, E>,
+        P: PoolProvider<T, Entry = E>,
+        F: FnOnce() -> Result<T, FactoryError>,
     {
-        let mut node = ManuallyDrop::new(
-            catch_operation(|| provider.take(create)).map_err(PoolError::Panic)??,
-        );
-        // Derivación única del puntero al valor, desde el &mut exclusivo del
-        // entry recién tomado. La alocación del Box no se mueve después.
-        // SAFETY: el valor existe y es válido mientras el guard viva.
-        let value = NonNull::from(&mut **node);
+        let node = catch_operation(|| provider.take(create)).map_err(PoolError::Panic)??;
         Ok(Self {
-            value_ptr: value,
-            node,
-            provider,
+            node: Some(node),
+            item: PhantomData,
         })
     }
 }
 
-impl<T: PoolItem, P: PoolProvider<T>> Deref for PoolGuard<T, P> {
+impl<T: PoolItem, E: PoolEntry<T>> Deref for PoolGuard<T, E> {
     type Target = T;
 
     #[inline(always)]
+    #[allow(clippy::expect_used)] // The entry is present throughout the guard's public lifetime.
     fn deref(&self) -> &Self::Target {
-        // SAFETY: el puntero fue derivado del &mut exclusivo del entry en el
-        // constructor; el Box no reemplaza su alocación mientras el guard vive.
-        unsafe { self.value_ptr.as_ref() }
+        self.node.as_ref().expect("guard entry missing").deref()
     }
 }
 
-impl<T: PoolItem, P: PoolProvider<T>> DerefMut for PoolGuard<T, P> {
+impl<T: PoolItem, E: PoolEntry<T>> DerefMut for PoolGuard<T, E> {
     #[inline(always)]
+    #[allow(clippy::expect_used)] // The entry is present throughout the guard's public lifetime.
     fn deref_mut(&mut self) -> &mut Self::Target {
-        // SAFETY: acceso exclusivo garantizado por el protocolo del pool
-        // (el entry está exclusivamente en este guard) y derivado del mismo
-        // NonNull que deref (única cadena de aliasing).
-        unsafe { self.value_ptr.as_mut() }
+        self.node.as_mut().expect("guard entry missing").deref_mut()
     }
 }
 
-// SAFETY: P::Entry implements StableDeref and the guard never replaces it.
-unsafe impl<T: PoolItem, P: PoolProvider<T>> StableDeref for PoolGuard<T, P> {}
+// SAFETY: E implements StableDeref and remains owned by the guard until Drop.
+unsafe impl<T: PoolItem, E: PoolEntry<T>> StableDeref for PoolGuard<T, E> {}
 
-// SAFETY: el guard es dueño exclusivo del entry (protocolo take/return del
-// pool) y T: PoolItem: Send. El NonNull cacheado apunta al valor dentro del
-// Box del entry, que viaja con el guard — moverlo entre threads no invalida
-// nada (la alocación del heap es thread-independiente).
-unsafe impl<T: PoolItem, P: PoolProvider<T>> Send for PoolGuard<T, P> {}
-
-// SAFETY: las referencias compartidas al guard solo exponen &T. Si T, el
-// entry y el provider son Sync, compartir el NonNull cacheado equivale a
-// compartir la referencia estable que entrega el entry.
-unsafe impl<T: PoolItem + Sync, P: PoolProvider<T> + Sync> Sync for PoolGuard<T, P> where
-    P::Entry: Sync
-{
-}
-
-impl<T: PoolItem, P: PoolProvider<T>> Drop for PoolGuard<T, P> {
+impl<T: PoolItem, E: PoolEntry<T>> Drop for PoolGuard<T, E> {
     #[inline(always)]
     fn drop(&mut self) {
-        // SAFETY: `node` is initialized by every constructor, `PoolGuard`
-        // cannot be reused after `Drop` starts, and this is its only take.
-        let node = unsafe { ManuallyDrop::take(&mut self.node) };
-        // SAFETY: reset por el MISMO NonNull cacheado — única cadena de
-        // derivación de referencias al valor (consistencia de aliasing).
-        unsafe { self.value_ptr.as_mut() }.reset();
+        if let Some(node) = self.node.as_mut() {
+            node.deref_mut().reset();
+        }
 
-        if let Err(node) = self.provider.return_entry(node) {
-            discard_entry(node);
+        // On reset panic, the still-owned entry is dropped with the guard.
+        if let Some(node) = self.node.take() {
+            node.return_to_pool();
         }
     }
-}
-
-/// Destroy rejected entries after provider access has ended.
-#[cold]
-#[inline(never)]
-fn discard_entry<E>(entry: E) {
-    drop(entry);
 }
 
 #[cfg(test)]

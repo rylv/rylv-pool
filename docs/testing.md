@@ -18,8 +18,10 @@ threshold. Test, fuzz, and benchmark sources are excluded from that calculation.
 ## Public integration tests
 
 - `tests/pool_provider.rs` verifies external provider implementations with an
-  independently chosen handle and a plain `Box<T>`. Guards preserve addresses and
-  reset rejected entries without imposing a concrete allocation wrapper.
+  independently chosen handle and an explicit boxed discard entry. Guards
+  preserve addresses and reset entries without imposing a concrete wrapper.
+- `tests/async_guard.rs` checks that a generic `Send` future can retain a
+  thread-local guard across an `.await`.
 - `tests/fixed_thread_local_pool.rs` covers fresh thread-local pools, independent
   storage on different threads, active guards exceeding retained capacity,
   non-Sync values moving between threads, ZSTs, zero capacity, factory bypass,

@@ -8,9 +8,9 @@ use std::{
     },
 };
 
-impl<T: PoolItem, P: PoolProvider<T>> PoolGuard<T, P> {
-    pub(crate) fn entry(&self) -> &P::Entry {
-        &self.node
+impl<T: PoolItem, E: PoolEntry<T>> PoolGuard<T, E> {
+    pub(crate) fn entry(&self) -> &E {
+        self.node.as_ref().unwrap()
     }
 }
 
@@ -344,6 +344,35 @@ struct TestProvider {
     return_mode: ReturnMode,
 }
 
+struct TestEntry {
+    value: Box<TestItem>,
+    state: Arc<ProviderState>,
+    return_mode: ReturnMode,
+}
+
+impl Deref for TestEntry {
+    type Target = TestItem;
+
+    fn deref(&self) -> &TestItem {
+        &self.value
+    }
+}
+
+impl DerefMut for TestEntry {
+    fn deref_mut(&mut self) -> &mut TestItem {
+        &mut self.value
+    }
+}
+
+// SAFETY: the value remains in its Box as the entry moves.
+unsafe impl StableDeref for TestEntry {}
+
+impl PoolEntry<TestItem> for TestEntry {
+    fn return_to_pool(self) {
+        let _ = return_test_value(&self.state, self.return_mode, self.value);
+    }
+}
+
 struct ProviderAccess<'a>(&'a Lifecycle);
 
 impl Drop for ProviderAccess<'_> {
@@ -353,7 +382,7 @@ impl Drop for ProviderAccess<'_> {
 }
 
 impl PoolProvider<TestItem> for TestProvider {
-    type Entry = Box<TestItem>;
+    type Entry = TestEntry;
 
     fn take<F, E>(&self, create: F) -> Result<Self::Entry, PoolError<E>>
     where
@@ -368,45 +397,30 @@ impl PoolProvider<TestItem> for TestProvider {
             TakeMode::CatchFactory | TakeMode::UncaughtFactory => {}
         }
         let stored = self.state.entry.lock().unwrap().take();
-        if let Some(entry) = stored {
-            return Ok(entry);
-        }
-        match self.take_mode {
-            TakeMode::CatchFactory => PoolError::catch(|| create().map(Box::new)),
-            TakeMode::UncaughtFactory => create().map(Box::new).map_err(PoolError::Factory),
-            TakeMode::Panic | TakeMode::ReturnedPanic => unreachable!(),
-        }
+        let value = if let Some(entry) = stored {
+            entry
+        } else {
+            match self.take_mode {
+                TakeMode::CatchFactory => PoolError::catch(|| create().map(Box::new)),
+                TakeMode::UncaughtFactory => create().map(Box::new).map_err(PoolError::Factory),
+                TakeMode::Panic | TakeMode::ReturnedPanic => unreachable!(),
+            }?
+        };
+        Ok(TestEntry {
+            value,
+            state: Arc::clone(&self.state),
+            return_mode: self.return_mode,
+        })
     }
 
     fn return_entry(&self, entry: Self::Entry) -> Result<(), Self::Entry> {
-        self.state.returns.fetch_add(1, Ordering::Relaxed);
-        self.state
-            .returned_value
-            .store(entry.value, Ordering::Relaxed);
-        self.state.lifecycle.events.lock().unwrap().push("return");
-        assert!(
-            !self
-                .state
-                .lifecycle
-                .provider_access
-                .swap(true, Ordering::Relaxed)
-        );
-        let _access = ProviderAccess(&self.state.lifecycle);
-
-        match self.return_mode {
-            ReturnMode::Store => {
-                let mut stored = self.state.entry.lock().unwrap();
-                if stored.is_some() {
-                    drop(stored);
-                    Err(entry)
-                } else {
-                    *stored = Some(entry);
-                    drop(stored);
-                    Ok(())
-                }
-            }
-            ReturnMode::Reject => Err(entry),
-            ReturnMode::Panic => panic!("provider return panic"),
+        match return_test_value(&self.state, self.return_mode, entry.value) {
+            Ok(()) => Ok(()),
+            Err(value) => Err(TestEntry {
+                value,
+                state: entry.state,
+                return_mode: entry.return_mode,
+            }),
         }
     }
 
@@ -415,6 +429,39 @@ impl PoolProvider<TestItem> for TestProvider {
         F: FnMut() -> Result<TestItem, E>,
     {
         Ok(0)
+    }
+}
+
+fn return_test_value(
+    state: &ProviderState,
+    return_mode: ReturnMode,
+    entry: Box<TestItem>,
+) -> Result<(), Box<TestItem>> {
+    state.returns.fetch_add(1, Ordering::Relaxed);
+    state.returned_value.store(entry.value, Ordering::Relaxed);
+    state.lifecycle.events.lock().unwrap().push("return");
+    assert!(
+        !state
+            .lifecycle
+            .provider_access
+            .swap(true, Ordering::Relaxed)
+    );
+    let _access = ProviderAccess(&state.lifecycle);
+
+    match return_mode {
+        ReturnMode::Store => {
+            let mut stored = state.entry.lock().unwrap();
+            if stored.is_some() {
+                drop(stored);
+                Err(entry)
+            } else {
+                *stored = Some(entry);
+                drop(stored);
+                Ok(())
+            }
+        }
+        ReturnMode::Reject => Err(entry),
+        ReturnMode::Panic => panic!("provider return panic"),
     }
 }
 
@@ -476,7 +523,7 @@ fn guard_returns_and_reuses_the_same_reset_entry() {
 
     assert_eq!(
         *state.lifecycle.events.lock().unwrap(),
-        ["reset", "return", "provider drop"]
+        ["provider drop", "reset", "return"]
     );
     let reused = PoolGuard::acquire_with(provider, || panic!("unexpected factory call")).unwrap();
     assert_eq!(address(&reused), original_address);
@@ -499,7 +546,7 @@ fn guard_rejection_destroys_once_after_provider_access_ends() {
 
     assert_eq!(
         *state.lifecycle.events.lock().unwrap(),
-        ["reset", "return", "item drop", "provider drop"]
+        ["provider drop", "reset", "return", "item drop"]
     );
     assert_eq!(state.lifecycle.resets.load(Ordering::Relaxed), 1);
     assert_eq!(state.lifecycle.drops.load(Ordering::Relaxed), 1);
@@ -682,7 +729,7 @@ fn guard_moves_and_mutation_preserve_the_value_address() {
 #[test]
 fn guard_can_move_to_another_thread_and_return_once() {
     fn requires_send<T: Send>() {}
-    requires_send::<PoolGuard<TestItem, TestProvider>>();
+    requires_send::<PoolGuard<TestItem, TestEntry>>();
 
     let (provider, state) = provider(ReturnMode::Store);
     let guard = PoolGuard::acquire_with(provider, || TestItem::new(42, &state.lifecycle)).unwrap();
@@ -727,7 +774,7 @@ fn guard_reset_panic_destroys_the_entry_and_skips_return() {
     assert!(state.entry.lock().unwrap().is_none());
     assert_eq!(
         *state.lifecycle.events.lock().unwrap(),
-        ["reset", "item drop", "provider drop"]
+        ["provider drop", "reset", "item drop"]
     );
 }
 
@@ -757,7 +804,7 @@ fn guard_return_panic_destroys_the_entry_after_reset() {
     );
     assert_eq!(
         *state.lifecycle.events.lock().unwrap(),
-        ["reset", "return", "item drop", "provider drop"]
+        ["provider drop", "reset", "return", "item drop"]
     );
 }
 
@@ -785,6 +832,7 @@ fn guard_returns_the_entry_when_client_code_unwinds() {
 struct HandleEntry {
     value: Box<TestItem>,
     routing: usize,
+    returned_routing: Arc<AtomicUsize>,
 }
 
 impl Deref for HandleEntry {
@@ -804,6 +852,13 @@ impl DerefMut for HandleEntry {
 // SAFETY: the owned Box keeps the value's address fixed as this handle moves.
 unsafe impl StableDeref for HandleEntry {}
 
+impl PoolEntry<TestItem> for HandleEntry {
+    fn return_to_pool(self) {
+        self.returned_routing.store(self.routing, Ordering::Relaxed);
+        assert_eq!(self.value.value, 0);
+    }
+}
+
 struct HandleProvider {
     returned_routing: Arc<AtomicUsize>,
 }
@@ -819,6 +874,7 @@ impl PoolProvider<TestItem> for HandleProvider {
             Ok(HandleEntry {
                 value: Box::new(create()?),
                 routing: 42,
+                returned_routing: Arc::clone(&self.returned_routing),
             })
         })
     }
@@ -861,13 +917,13 @@ fn guard_preserves_provider_owned_entry_context() {
 struct BoxOnlyProvider;
 
 impl<T: PoolItem> PoolProvider<T> for BoxOnlyProvider {
-    type Entry = Box<T>;
+    type Entry = DiscardEntry<T>;
 
     fn take<F, E>(&self, create: F) -> Result<Self::Entry, PoolError<E>>
     where
         F: FnOnce() -> Result<T, E>,
     {
-        PoolError::catch(|| create().map(Box::new))
+        PoolError::catch(|| create().map(Box::new).map(DiscardEntry::from))
     }
 
     fn return_entry(&self, entry: Self::Entry) -> Result<(), Self::Entry> {

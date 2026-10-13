@@ -3,10 +3,14 @@
 Generic pooling with pluggable providers, extracted from `rylv_utils`.
 
 - `PoolItem` defines how reusable values are reset.
-- `PoolProvider` controls acquisition, returns, and prewarming.
+- `PoolProvider` controls acquisition, direct returns, and prewarming.
+- `PoolEntry` carries its own return route for automatic guard drops.
+- `DiscardEntry<T>` explicitly discards a boxed value when no pool retention is
+  needed.
 - `PoolProvider::Entry` lets each provider choose its own ownership handle and
   routing context, with mutable access and `StableDeref` guarantees.
-- `PoolGuard` returns values automatically on drop and implements `StableDeref`.
+- `PoolGuard<T, E>` returns values automatically on drop through concrete entry
+  type `E`, without a provider bound on the guard.
 - `FixedThreadLocalPool<T, N>` provides fixed-capacity thread-local storage and
   lock-free returns from other threads. `N` limits retained entries, not active guards.
   Its static TLS key reference implements `PoolProvider` directly.

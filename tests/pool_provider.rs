@@ -6,7 +6,10 @@ use std::{
     },
 };
 
-use rylv_pool::{FixedThreadLocalPoolGuard, PoolError, PoolGuard, PoolItem, PoolProvider};
+use rylv_pool::{
+    DiscardEntry, FixedThreadLocalPoolGuard, PoolEntry, PoolError, PoolGuard, PoolItem,
+    PoolProvider,
+};
 
 const CAPACITY: usize = 2;
 
@@ -41,6 +44,16 @@ impl std::ops::DerefMut for Entry {
 
 // SAFETY: moving Entry never moves the boxed Item.
 unsafe impl stable_deref_trait::StableDeref for Entry {}
+
+impl PoolEntry<Item> for Entry {
+    fn return_to_pool(self) {
+        let origin = self.origin;
+        let mut queue = QUEUES[origin].lock().unwrap();
+        if queue.len() < CAPACITY {
+            queue.push_back(self);
+        }
+    }
+}
 
 static CURRENT_POOL_ID: AtomicUsize = AtomicUsize::new(0);
 static QUEUES: LazyLock<[Mutex<VecDeque<Entry>>; 2]> =
@@ -114,7 +127,7 @@ impl PoolProvider<Item> for QueuePoolProvider {
     }
 }
 
-type Guard = PoolGuard<Item, QueuePoolProvider>;
+type Guard = PoolGuard<Item, Entry>;
 
 #[test]
 fn guard_is_sync_when_its_components_are_sync() {
@@ -151,13 +164,13 @@ fn queue_provider_routes_returns_without_local_or_remote_concepts() {
 struct BoxProvider;
 
 impl PoolProvider<Item> for BoxProvider {
-    type Entry = Box<Item>;
+    type Entry = DiscardEntry<Item>;
 
     fn take<F, E>(&self, create: F) -> Result<Self::Entry, PoolError<E>>
     where
         F: FnOnce() -> Result<Item, E>,
     {
-        PoolError::catch(|| create().map(Box::new))
+        PoolError::catch(|| create().map(Box::new).map(DiscardEntry::from))
     }
 
     fn return_entry(&self, entry: Self::Entry) -> Result<(), Self::Entry> {
@@ -174,7 +187,7 @@ impl PoolProvider<Item> for BoxProvider {
 }
 
 #[test]
-fn provider_can_use_a_plain_box_and_guard_moves_preserve_the_address() {
+fn provider_can_discard_a_boxed_entry_and_guard_moves_preserve_the_address() {
     fn requires_stable_deref(_: &impl stable_deref_trait::StableDeref) {}
 
     let mut guard = PoolGuard::acquire_with(BoxProvider, || Item(42)).unwrap();

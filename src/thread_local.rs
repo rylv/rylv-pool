@@ -9,7 +9,10 @@ use std::{
 
 use stable_deref_trait::StableDeref;
 
-use super::{PoolError, PoolGuard, PoolItem, PoolProvider, core::Storage};
+use super::{
+    PoolError, PoolGuard, PoolItem, PoolProvider,
+    core::{PoolEntry, Storage},
+};
 
 mod remote_returns;
 
@@ -38,6 +41,7 @@ struct ThreadLocalMetadata<T: PoolItem, const N: usize> {
 #[doc(hidden)]
 pub struct FixedThreadLocalEntry<T: PoolItem, const N: usize> {
     node: Box<Entry<T, N>>,
+    key: &'static LocalKey<FixedThreadLocalPool<T, N>>,
 }
 
 impl<T: PoolItem, const N: usize> Deref for FixedThreadLocalEntry<T, N> {
@@ -58,6 +62,21 @@ impl<T: PoolItem, const N: usize> DerefMut for FixedThreadLocalEntry<T, N> {
 
 // SAFETY: the value lives in a Box and the entry never replaces the allocation.
 unsafe impl<T: PoolItem, const N: usize> StableDeref for FixedThreadLocalEntry<T, N> {}
+
+impl<T: PoolItem, const N: usize> PoolEntry<T> for FixedThreadLocalEntry<T, N> {
+    #[inline(always)]
+    fn return_to_pool(self) {
+        if let Err(entry) = try_return_to_origin(self.key, self.node) {
+            discard_rejected(entry);
+        }
+    }
+}
+
+#[cold]
+#[inline(never)]
+fn discard_rejected<T: PoolItem, const N: usize>(entry: Box<Entry<T, N>>) {
+    drop(entry);
+}
 
 impl<T: PoolItem, const N: usize> ThreadLocalMetadata<T, N> {
     #[inline(always)]
@@ -178,8 +197,7 @@ impl<T: PoolItem, const N: usize> Default for FixedThreadLocalPool<T, N> {
 }
 
 /// Guard using a consumer-defined thread-local pool key as its provider.
-pub type FixedThreadLocalPoolGuard<T, const N: usize> =
-    PoolGuard<T, &'static LocalKey<FixedThreadLocalPool<T, N>>>;
+pub type FixedThreadLocalPoolGuard<T, const N: usize> = PoolGuard<T, FixedThreadLocalEntry<T, N>>;
 
 /// If storage is unavailable during thread shutdown, acquisition creates an
 /// unpooled entry and warming does nothing. Returns reject entries so they
@@ -196,7 +214,10 @@ impl<T: PoolItem, const N: usize> PoolProvider<T>
     {
         PoolError::catch(|| {
             if let Ok(Some(entry)) = self.try_with(FixedThreadLocalPool::try_take) {
-                return Ok(FixedThreadLocalEntry { node: entry });
+                return Ok(FixedThreadLocalEntry {
+                    node: entry,
+                    key: self,
+                });
             }
 
             // User code and allocation run after TLS storage access has ended.
@@ -206,13 +227,15 @@ impl<T: PoolItem, const N: usize> PoolProvider<T>
                 .unwrap_or_else(|_| ThreadLocalMetadata::new(thread::current().id(), Weak::new()));
             Ok(FixedThreadLocalEntry {
                 node: Box::new(Entry::new(value, metadata)),
+                key: self,
             })
         })
     }
 
     #[inline(always)]
     fn return_entry(&self, entry: Self::Entry) -> Result<(), Self::Entry> {
-        try_return_to_origin(self, entry.node).map_err(|node| FixedThreadLocalEntry { node })
+        try_return_to_origin(self, entry.node)
+            .map_err(|node| FixedThreadLocalEntry { node, key: self })
     }
 
     fn warm<F, E>(&self, count: usize, mut create: F) -> Result<usize, PoolError<E>>
