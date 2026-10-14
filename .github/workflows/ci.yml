@@ -152,7 +152,7 @@ jobs:
           cargo llvm-cov report --ignore-filename-regex "$COVERAGE_IGNORE" >> "$GITHUB_STEP_SUMMARY"
       - name: Upload coverage reports
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: coverage
           path: target/coverage/
@@ -218,7 +218,7 @@ jobs:
       - run: cargo fuzz run pool_lifecycle --target x86_64-unknown-linux-gnu -- -max_total_time=60 -max_len=64 -timeout=10 -rss_limit_mb=1024
       - name: Upload failure artifacts and generated lockfile
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: fuzz-artifacts
           path: |
@@ -322,7 +322,7 @@ jobs:
           exit "$gate_status"
       - name: Upload benchmark estimates and comparison
         if: ${{ !cancelled() }}
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
         with:
           name: benchmark-comparison
           path: |
