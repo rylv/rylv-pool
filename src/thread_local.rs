@@ -11,7 +11,7 @@ use stable_deref_trait::StableDeref;
 
 use super::{
     PoolError, PoolGuard, PoolItem, PoolProvider,
-    core::{PoolEntry, Storage},
+    core::{PoolEntry, SplittablePoolEntry, Storage},
 };
 
 mod remote_returns;
@@ -44,6 +44,15 @@ pub struct FixedThreadLocalEntry<T: PoolItem, const N: usize> {
     key: &'static LocalKey<FixedThreadLocalPool<T, N>>,
 }
 
+/// Return route retained while a thread-local guard's value is detached.
+///
+/// Keep this handle and pass it back to `FixedThreadLocalPoolGuard::from_parts`
+/// to return the value to its original thread-local pool.
+pub struct FixedThreadLocalReturnHandle<T: PoolItem, const N: usize> {
+    metadata: ThreadLocalMetadata<T, N>,
+    key: &'static LocalKey<FixedThreadLocalPool<T, N>>,
+}
+
 impl<T: PoolItem, const N: usize> Deref for FixedThreadLocalEntry<T, N> {
     type Target = T;
 
@@ -68,6 +77,28 @@ impl<T: PoolItem, const N: usize> PoolEntry<T> for FixedThreadLocalEntry<T, N> {
     fn return_to_pool(self) {
         if let Err(entry) = try_return_to_origin(self.key, self.node) {
             discard_rejected(entry);
+        }
+    }
+}
+
+impl<T: PoolItem, const N: usize> SplittablePoolEntry<T> for FixedThreadLocalEntry<T, N> {
+    type ReturnHandle = FixedThreadLocalReturnHandle<T, N>;
+
+    fn into_parts(self) -> (T, Self::ReturnHandle) {
+        let Entry { value, metadata } = *self.node;
+        (
+            value,
+            FixedThreadLocalReturnHandle {
+                metadata,
+                key: self.key,
+            },
+        )
+    }
+
+    fn from_parts(value: T, handle: Self::ReturnHandle) -> Self {
+        Self {
+            node: Box::new(Entry::new(value, handle.metadata)),
+            key: handle.key,
         }
     }
 }

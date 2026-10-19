@@ -41,6 +41,21 @@ pub trait PoolEntry<T: PoolItem>: DerefMut<Target = T> + StableDeref + Send + 's
     fn return_to_pool(self);
 }
 
+/// An entry whose value can be detached from its return route and later reattached.
+///
+/// Splitting ends the original guard's lifetime. Reattaching creates a new
+/// address-stable guard; the value's address need not survive the split.
+pub trait SplittablePoolEntry<T: PoolItem>: PoolEntry<T> {
+    /// Opaque ownership of the route back to the entry's original pool.
+    type ReturnHandle: Send + 'static;
+
+    /// Move the value out of the entry without resetting it.
+    fn into_parts(self) -> (T, Self::ReturnHandle);
+
+    /// Build an entry from a value and its original return route.
+    fn from_parts(value: T, handle: Self::ReturnHandle) -> Self;
+}
+
 /// A boxed entry that is intentionally discarded when its guard is dropped.
 ///
 /// Providers that retain entries should define their own [`PoolEntry`] type.
@@ -76,6 +91,18 @@ impl<T: PoolItem> PoolEntry<T> for DiscardEntry<T> {
     #[inline]
     fn return_to_pool(self) {
         drop(self);
+    }
+}
+
+impl<T: PoolItem> SplittablePoolEntry<T> for DiscardEntry<T> {
+    type ReturnHandle = ();
+
+    fn into_parts(self) -> (T, ()) {
+        (*self.0, ())
+    }
+
+    fn from_parts(value: T, (): ()) -> Self {
+        Self(Box::new(value))
     }
 }
 
@@ -326,6 +353,33 @@ impl<T: PoolItem, E: PoolEntry<T>> PoolGuard<T, E> {
             node: Some(node),
             item: PhantomData,
         })
+    }
+}
+
+impl<T: PoolItem, E: SplittablePoolEntry<T>> PoolGuard<T, E> {
+    /// Separate the value from its return route without resetting it.
+    ///
+    /// The caller owns the value until it is reattached. Dropping either part
+    /// separately does not return a value to the pool.
+    ///
+    /// # Panics
+    ///
+    /// Panics only if the guard's internal entry has already been removed,
+    /// which cannot happen through the public API.
+    #[must_use]
+    #[allow(clippy::expect_used)] // The entry exists until this method takes it.
+    pub fn into_parts(mut self) -> (T, E::ReturnHandle) {
+        self.node.take().expect("guard entry missing").into_parts()
+    }
+
+    /// Reattach a value to a return route obtained from [`Self::into_parts`].
+    /// Dropping the resulting guard resets the value and returns it to its pool.
+    #[must_use]
+    pub fn from_parts(value: T, handle: E::ReturnHandle) -> Self {
+        Self {
+            node: Some(E::from_parts(value, handle)),
+            item: PhantomData,
+        }
     }
 }
 
