@@ -6,6 +6,7 @@
 
 use std::{
     convert::Infallible,
+    marker::PhantomData,
     mem::ManuallyDrop,
     ops::{Deref, DerefMut},
 };
@@ -111,6 +112,49 @@ pub trait PoolProvider<T: PoolItem>: Send + 'static {
     fn warm<F, E>(&self, count: usize, create: F) -> Result<usize, PoolError<E>>
     where
         F: FnMut() -> Result<T, E>;
+}
+
+/// An address-stable provider entry whose value can be detached and reattached.
+///
+/// Splitting ends the original guard's lifetime. The value's address may
+/// change before the new guard is constructed.
+pub trait SplittablePoolEntry<T: PoolItem>:
+    DerefMut<Target = T> + StableDeref + Send + 'static
+{
+    /// Opaque return context retained while the value is detached.
+    type ReturnHandle: Send + 'static;
+
+    /// Move the value out without resetting it.
+    fn into_parts(self) -> (T, Self::ReturnHandle);
+
+    /// Rebuild an entry from a value and its original return context.
+    fn from_parts(value: T, handle: Self::ReturnHandle) -> Self;
+}
+
+impl<T: PoolItem> SplittablePoolEntry<T> for Box<T> {
+    type ReturnHandle = ();
+
+    fn into_parts(self) -> (T, ()) {
+        (*self, ())
+    }
+
+    fn from_parts(value: T, (): ()) -> Self {
+        Self::new(value)
+    }
+}
+
+/// Provider and return context retained while a guard's value is detached.
+///
+/// Dropping this handle without reattaching a value does not return an entry
+/// to the pool.
+#[must_use]
+pub struct PoolGuardReturnHandle<T: PoolItem, P: PoolProvider<T>>
+where
+    P::Entry: SplittablePoolEntry<T>,
+{
+    provider: P,
+    entry_handle: <P::Entry as SplittablePoolEntry<T>>::ReturnHandle,
+    item: PhantomData<T>,
 }
 
 // Keep this helper internal even if its containing module becomes public.
@@ -269,6 +313,49 @@ impl<T: PoolItem, P: PoolProvider<T>> PoolGuard<T, P> {
             ),
             provider,
         })
+    }
+}
+
+impl<T: PoolItem, P: PoolProvider<T>> PoolGuard<T, P>
+where
+    P::Entry: SplittablePoolEntry<T>,
+{
+    /// Separate the value from its original provider without resetting it.
+    ///
+    /// The caller owns the value until it is reattached. Dropping either part
+    /// separately does not return an entry to the pool.
+    pub fn into_parts(self) -> (T, PoolGuardReturnHandle<T, P>) {
+        let mut guard = ManuallyDrop::new(self);
+        // SAFETY: ManuallyDrop prevents Guard::drop. Each field is moved out
+        // exactly once; no reference to the guard can survive this method.
+        let provider = unsafe { std::ptr::read(&raw const guard.provider) };
+        // SAFETY: the node is initialized by every constructor and cannot be
+        // taken by another caller after this consuming method starts.
+        let node = unsafe { ManuallyDrop::take(&mut guard.node) };
+        let (value, entry_handle) = node.into_parts();
+        (
+            value,
+            PoolGuardReturnHandle {
+                provider,
+                entry_handle,
+                item: PhantomData,
+            },
+        )
+    }
+
+    /// Reattach a value to its original provider and return context.
+    /// Dropping the resulting guard resets and returns the value.
+    #[must_use]
+    pub fn from_parts(value: T, handle: PoolGuardReturnHandle<T, P>) -> Self {
+        let PoolGuardReturnHandle {
+            provider,
+            entry_handle,
+            item: _,
+        } = handle;
+        Self {
+            node: ManuallyDrop::new(P::Entry::from_parts(value, entry_handle)),
+            provider,
+        }
     }
 }
 

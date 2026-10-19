@@ -9,7 +9,10 @@ use std::{
 
 use stable_deref_trait::StableDeref;
 
-use super::{PoolError, PoolGuard, PoolItem, PoolProvider, core::Storage};
+use super::{
+    PoolError, PoolGuard, PoolItem, PoolProvider,
+    core::{SplittablePoolEntry, Storage},
+};
 
 mod remote_returns;
 
@@ -40,6 +43,11 @@ pub struct FixedThreadLocalEntry<T: PoolItem, const N: usize> {
     node: Box<Entry<T, N>>,
 }
 
+/// Return context retained while a thread-local entry's value is detached.
+pub struct FixedThreadLocalReturnHandle<T: PoolItem, const N: usize> {
+    metadata: ThreadLocalMetadata<T, N>,
+}
+
 impl<T: PoolItem, const N: usize> Deref for FixedThreadLocalEntry<T, N> {
     type Target = T;
 
@@ -58,6 +66,21 @@ impl<T: PoolItem, const N: usize> DerefMut for FixedThreadLocalEntry<T, N> {
 
 // SAFETY: the value lives in a Box and the entry never replaces the allocation.
 unsafe impl<T: PoolItem, const N: usize> StableDeref for FixedThreadLocalEntry<T, N> {}
+
+impl<T: PoolItem, const N: usize> SplittablePoolEntry<T> for FixedThreadLocalEntry<T, N> {
+    type ReturnHandle = FixedThreadLocalReturnHandle<T, N>;
+
+    fn into_parts(self) -> (T, Self::ReturnHandle) {
+        let Entry { value, metadata } = *self.node;
+        (value, FixedThreadLocalReturnHandle { metadata })
+    }
+
+    fn from_parts(value: T, handle: Self::ReturnHandle) -> Self {
+        Self {
+            node: Box::new(Entry::new(value, handle.metadata)),
+        }
+    }
+}
 
 impl<T: PoolItem, const N: usize> ThreadLocalMetadata<T, N> {
     #[inline(always)]

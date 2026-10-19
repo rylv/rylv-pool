@@ -39,6 +39,31 @@ scratch.0.extend_from_slice(b"reusable storage");
 # Ok::<(), rylv_pool::PoolError<std::convert::Infallible>>(())
 ```
 
+## Temporarily detach a value
+
+`PoolGuard::into_parts` moves out the value and keeps its original provider and
+return route in a separate handle. `PoolGuard::from_parts` joins them again.
+The value is reset and returned only when the reassembled guard is dropped.
+Providers can support this API by implementing `SplittablePoolEntry` for their
+entry type. The value's address may change while detached.
+
+With a wrapper whose `PoolItem::reset` clears its `BytesMut`, the send flow is:
+
+```rust,ignore
+let (Buffer(buffer), route) = guard.into_parts();
+let bytes = buffer.freeze();
+let outbound = bytes.clone();
+send_http(outbound).await;
+// Every clone must be released before zero-copy recovery can succeed.
+let buffer = bytes.try_into_mut()?;
+let guard = FixedThreadLocalPoolGuard::from_parts(Buffer(buffer), route);
+drop(guard);
+```
+
+Dropping the detached value or return handle separately does not return an
+entry to the pool. `Bytes::try_into_mut` returns the original `Bytes` on failure,
+so the caller can retry after the outstanding clones are dropped.
+
 ## Testing and CI
 
 CI includes stable and MSRV builds on Linux/macOS/Windows, debug/release tests,

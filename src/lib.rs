@@ -27,8 +27,10 @@ mod core;
 mod error;
 mod thread_local;
 
-pub use core::{PoolGuard, PoolItem, PoolProvider};
+pub use core::{PoolGuard, PoolGuardReturnHandle, PoolItem, PoolProvider, SplittablePoolEntry};
 pub use error::{PanicError, PoolError};
 #[doc(hidden)]
 pub use thread_local::FixedThreadLocalEntry;
-pub use thread_local::{FixedThreadLocalPool, FixedThreadLocalPoolGuard};
+pub use thread_local::{
+    FixedThreadLocalPool, FixedThreadLocalPoolGuard, FixedThreadLocalReturnHandle,
+};
